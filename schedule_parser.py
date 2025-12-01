@@ -103,10 +103,13 @@ def fetch_html(url: str, group: str, session: requests.Session) -> str:
     через `/Schedule/SearchBarSuggestions`, затем запрашивает HTML расписания
     через `/Schedule/ScheduleCard`.
     """
+    if not url or not group:
+        logging.error("fetch_html: пустые url или group")
+        return ""
 
-    selection_key = extract_selection_from_url(url) or group
-    normalized_key = normalize_selection(selection_key, session)
     try:
+        selection_key = extract_selection_from_url(url) or group
+        normalized_key = normalize_selection(selection_key, session)
         response = session.get(
             "https://rasp.rea.ru/Schedule/ScheduleCard",
             params={"selection": normalized_key},
@@ -114,7 +117,13 @@ def fetch_html(url: str, group: str, session: requests.Session) -> str:
             timeout=20,
         )
         response.raise_for_status()
-    except requests.RequestException as exc:  # pragma: no cover - сеть
+    except requests.Timeout:
+        logging.error("Timeout при загрузке расписания (url=%s)", url)
+        return ""
+    except requests.ConnectionError as exc:
+        logging.error("Ошибка соединения: %s", exc)
+        return ""
+    except requests.RequestException as exc:
         logging.error("Не удалось загрузить расписание: %s", exc)
         return ""
     return response.text
@@ -126,6 +135,8 @@ def normalize_selection(selection: str, session: requests.Session) -> str:
     Если API подсказок недоступно или не вернуло результатов, возвращается
     исходное значение selection.
     """
+    if not selection:
+        return ""
 
     try:
         response = session.get(
@@ -136,15 +147,21 @@ def normalize_selection(selection: str, session: requests.Session) -> str:
         )
         response.raise_for_status()
         data = response.json()
-    except requests.RequestException as exc:  # pragma: no cover - сеть
+    except requests.Timeout:
+        logging.warning("Timeout при уточнении ключа группы")
+        return selection
+    except requests.RequestException as exc:
         logging.warning("Не удалось уточнить ключ группы: %s", exc)
         return selection
     except ValueError:
         logging.warning("API подсказок вернуло некорректный ответ")
         return selection
 
+    if not isinstance(data, list):
+        return selection
+    
     for item in data:
-        if item.get("key", "").lower() == selection.lower():
+        if isinstance(item, dict) and item.get("key", "").lower() == selection.lower():
             return item["key"]
     return selection
 
@@ -161,9 +178,16 @@ def extract_selection_from_url(url: str) -> Optional[str]:
 def parse_schedule(html: str, session: requests.Session) -> List[ScheduleEvent]:
     """Парсит HTML расписания в список событий."""
 
-    if not html:
+    if not html or not isinstance(html, str):
+        logging.debug("parse_schedule: пустой или невалидный HTML")
         return []
-    soup = BeautifulSoup(html, "html.parser")
+    
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception as exc:
+        logging.error("Ошибка парсинга HTML: %s", exc)
+        return []
+    
     events: List[ScheduleEvent] = []
     for table in soup.find_all("table"):
         header = table.find("h5")
@@ -171,12 +195,16 @@ def parse_schedule(html: str, session: requests.Session) -> List[ScheduleEvent]:
             continue
         date = parse_date_from_header(header.get_text(strip=True))
         if not date:
-            logging.warning("Не удалось разобрать дату в заголовке: %s", header)
+            logging.debug("Не удалось разобрать дату в заголовке: %s", header)
             continue
         for anchor in table.find_all("a", class_="task"):
-            event = build_event_from_row(anchor, date, session)
-            if event:
-                events.append(event)
+            try:
+                event = build_event_from_row(anchor, date, session)
+                if event:
+                    events.append(event)
+            except Exception as exc:
+                logging.warning("Ошибка при разборе события: %s", exc)
+                continue
     return events
 
 
@@ -284,6 +312,7 @@ def fetch_details(
 
     if not element_id:
         return None, None
+    
     try:
         response = session.get(
             "https://rasp.rea.ru/Schedule/GetDetailsById",
@@ -292,12 +321,27 @@ def fetch_details(
             timeout=15,
         )
         response.raise_for_status()
-    except requests.RequestException as exc:  # pragma: no cover - сеть
-        logging.warning("Не удалось получить детали занятия %s: %s", element_id, exc)
+    except requests.Timeout:
+        logging.debug("Timeout при получении деталей элемента %s", element_id)
+        return None, None
+    except requests.RequestException as exc:
+        logging.debug("Не удалось получить детали занятия %s: %s", element_id, exc)
         return None, None
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    body = soup.find("div", class_="element-info-body")
+    try:
+        soup = BeautifulSoup(response.text, "html.parser")
+        body = soup.find("div", class_="element-info-body")
+    except Exception as exc:
+        logging.warning("Ошибка при парсинге деталей: %s", exc)
+        return None, None
+    
+    if not body:
+        return None, None
+
+    lines = [line.strip() for line in body.get_text("\n").splitlines() if line.strip()]
+    teacher = extract_teacher(lines)
+    extra_info = extract_extra_info(lines)
+    return teacher, extra_info
     if not body:
         return None, None
 
@@ -400,76 +444,93 @@ def build_ics(events: List[ScheduleEvent], output_path: Path, target: str) -> No
     - "mobile": локальная временная зона, цвета событий, напоминания.
     - "google": время в UTC, без нестандартных полей.
     """
+    if not events:
+        logging.warning("build_ics: список событий пуст")
+        return
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//REA Schedule Parser//EN",
-        "CALSCALE:GREGORIAN",
-        "METHOD:PUBLISH",
-    ]
-    if target == "mobile":
-        lines.extend(
-            [
-                "X-WR-TIMEZONE:Europe/Moscow",
-                "BEGIN:VTIMEZONE",
-                "TZID:Europe/Moscow",
-                "BEGIN:STANDARD",
-                "DTSTART:19300101T000000",
-                "TZOFFSETFROM:+0300",
-                "TZOFFSETTO:+0300",
-                "TZNAME:MSK",
-                "END:STANDARD",
-                "END:VTIMEZONE",
-            ]
-        )
-    else:
-        lines.append("X-WR-TIMEZONE:UTC")
+    if target not in ("mobile", "google"):
+        logging.error("build_ics: неизвестный target='%s'", target)
+        return
 
-    lesson_counters: dict[str, int] = {}
-    dtstamp = dt.datetime.now(tz=dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    for event in sorted(events, key=lambda e: (e.date, e.start_time)):
-        start_dt = dt.datetime.combine(event.date, event.start_time, tzinfo=MOSCOW_TZ)
-        end_dt = dt.datetime.combine(event.date, event.end_time, tzinfo=MOSCOW_TZ)
-        summary, color = build_event_summary(event, lesson_counters)
-        description_parts = []
-        if event.teacher:
-            description_parts.append(f"Преподаватель: {event.teacher}")
-        if event.location:
-            description_parts.append(f"Аудитория: {event.location}")
-        if event.extra_info:
-            description_parts.append(event.extra_info)
-        description = "\n".join(description_parts)
-        alarms = build_event_alarms(event.pair_number) if target == "mobile" else []
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logging.error("Не удалось создать директорию %s: %s", output_path.parent, exc)
+        return
 
-        if target == "google":
-            dt_start_str = start_dt.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            dt_end_str = end_dt.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            dtstart_line = f"DTSTART:{dt_start_str}"
-            dtend_line = f"DTEND:{dt_end_str}"
-        else:
-            dtstart_line = f"DTSTART;TZID=Europe/Moscow:{start_dt.strftime('%Y%m%dT%H%M%S')}"
-            dtend_line = f"DTEND;TZID=Europe/Moscow:{end_dt.strftime('%Y%m%dT%H%M%S')}"
-
-        event_block = [
-            "BEGIN:VEVENT",
-            f"UID:{event.element_id or hash(summary + str(start_dt))}@rasp.rea.ru",
-            f"DTSTAMP:{dtstamp}",
-            f"SUMMARY:{escape_ics(summary)}",
-            dtstart_line,
-            dtend_line,
-            f"DESCRIPTION:{escape_ics(description)}",
-            f"LOCATION:{escape_ics(event.location or '')}",
+    try:
+        lines = [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//REA Schedule Parser//EN",
+            "CALSCALE:GREGORIAN",
+            "METHOD:PUBLISH",
         ]
-        if target == "mobile" and color:
-            event_block.append(f"COLOR:{color}")
-        event_block.extend(alarms)
-        event_block.append("END:VEVENT")
-        lines.extend(event_block)
+        if target == "mobile":
+            lines.extend(
+                [
+                    "X-WR-TIMEZONE:Europe/Moscow",
+                    "BEGIN:VTIMEZONE",
+                    "TZID:Europe/Moscow",
+                    "BEGIN:STANDARD",
+                    "DTSTART:19300101T000000",
+                    "TZOFFSETFROM:+0300",
+                    "TZOFFSETTO:+0300",
+                    "TZNAME:MSK",
+                    "END:STANDARD",
+                    "END:VTIMEZONE",
+                ]
+            )
+        else:
+            lines.append("X-WR-TIMEZONE:UTC")
 
-    lines.append("END:VCALENDAR")
-    output_path.write_text("\n".join(lines), encoding="utf-8")
+        lesson_counters: dict[str, int] = {}
+        dtstamp = dt.datetime.now(tz=dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        for event in sorted(events, key=lambda e: (e.date, e.start_time)):
+            start_dt = dt.datetime.combine(event.date, event.start_time, tzinfo=MOSCOW_TZ)
+            end_dt = dt.datetime.combine(event.date, event.end_time, tzinfo=MOSCOW_TZ)
+            summary, color = build_event_summary(event, lesson_counters)
+            description_parts = []
+            if event.teacher:
+                description_parts.append(f"Преподаватель: {event.teacher}")
+            if event.location:
+                description_parts.append(f"Аудитория: {event.location}")
+            if event.extra_info:
+                description_parts.append(event.extra_info)
+            description = "\n".join(description_parts)
+            alarms = build_event_alarms(event.pair_number) if target == "mobile" else []
+
+            if target == "google":
+                dt_start_str = start_dt.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                dt_end_str = end_dt.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                dtstart_line = f"DTSTART:{dt_start_str}"
+                dtend_line = f"DTEND:{dt_end_str}"
+            else:
+                dtstart_line = f"DTSTART;TZID=Europe/Moscow:{start_dt.strftime('%Y%m%dT%H%M%S')}"
+                dtend_line = f"DTEND;TZID=Europe/Moscow:{end_dt.strftime('%Y%m%dT%H%M%S')}"
+
+            event_block = [
+                "BEGIN:VEVENT",
+                f"UID:{event.element_id or hash(summary + str(start_dt))}@rasp.rea.ru",
+                f"DTSTAMP:{dtstamp}",
+                f"SUMMARY:{escape_ics(summary)}",
+                dtstart_line,
+                dtend_line,
+                f"DESCRIPTION:{escape_ics(description)}",
+                f"LOCATION:{escape_ics(event.location or '')}",
+            ]
+            if target == "mobile" and color:
+                event_block.append(f"COLOR:{color}")
+            event_block.extend(alarms)
+            event_block.append("END:VEVENT")
+            lines.extend(event_block)
+
+        lines.append("END:VCALENDAR")
+        output_path.write_text("\n".join(lines), encoding="utf-8")
+        logging.info("Файл %s создан успешно (%d событий)", output_path, len(events))
+    except Exception as exc:
+        logging.error("Ошибка при создании .ics файла: %s", exc)
+        raise
 
 
 def format_weekly_schedule(events: List[ScheduleEvent], reference_date: Optional[dt.date] = None) -> str:
@@ -478,28 +539,32 @@ def format_weekly_schedule(events: List[ScheduleEvent], reference_date: Optional
     if not events:
         return "Расписание не найдено."
 
-    ref_date = reference_date or dt.date.today()
-    start_of_week = ref_date - dt.timedelta(days=ref_date.weekday())
-    end_of_week = start_of_week + dt.timedelta(days=6)
-    weekly_events = [
-        event for event in events if start_of_week <= event.date <= end_of_week
-    ]
-    if not weekly_events:
-        return "На эту неделю занятий нет."
+    try:
+        ref_date = reference_date or dt.date.today()
+        start_of_week = ref_date - dt.timedelta(days=ref_date.weekday())
+        end_of_week = start_of_week + dt.timedelta(days=6)
+        weekly_events = [
+            event for event in events if start_of_week <= event.date <= end_of_week
+        ]
+        if not weekly_events:
+            return "На эту неделю занятий нет."
 
-    lines: List[str] = []
-    for date, day_events in _group_events_by_date(weekly_events):
-        lines.append(date.strftime("%A, %d.%m.%Y"))
-        for event in sorted(day_events, key=lambda e: e.start_time):
-            lesson_type = f" ({event.lesson_type})" if event.lesson_type else ""
-            teacher = f" — {event.teacher}" if event.teacher else ""
-            location = f" [{event.location}]" if event.location else ""
-            lines.append(
-                f"  {event.start_time.strftime('%H:%M')}–{event.end_time.strftime('%H:%M')}"
-                f" {event.title}{lesson_type}{teacher}{location}"
-            )
-        lines.append("")
-    return "\n".join(lines).strip()
+        lines: List[str] = []
+        for date, day_events in _group_events_by_date(weekly_events):
+            lines.append(date.strftime("%A, %d.%m.%Y"))
+            for event in sorted(day_events, key=lambda e: e.start_time):
+                lesson_type = f" ({event.lesson_type})" if event.lesson_type else ""
+                teacher = f" — {event.teacher}" if event.teacher else ""
+                location = f" [{event.location}]" if event.location else ""
+                lines.append(
+                    f"  {event.start_time.strftime('%H:%M')}–{event.end_time.strftime('%H:%M')}"
+                    f" {event.title}{lesson_type}{teacher}{location}"
+                )
+            lines.append("")
+        return "\n".join(lines).strip()
+    except Exception as exc:
+        logging.error("Ошибка при форматировании расписания: %s", exc)
+        return "Ошибка при обработке расписания."
 
 
 def _group_events_by_date(events: List[ScheduleEvent]) -> Iterable[Tuple[dt.date, List[ScheduleEvent]]]:
@@ -589,21 +654,36 @@ def main() -> None:
         format="%(levelname)s: %(message)s",
     )
 
+    if not args.url or not args.group:
+        logging.error("URL и код группы не могут быть пустыми")
+        sys.exit(1)
+
     group_slug = slugify_group_name(args.group)
     mobile_output = args.output or Path.cwd() / f"schedule_{group_slug}.ics"
     google_output = args.google_output or Path.cwd() / f"schedule_{group_slug}_google.ics"
 
-    with requests.Session() as session:
-        html = fetch_html(args.url, args.group, session)
-        events = parse_schedule(html, session)
-        if not events:
-            logging.error("Не найдено ни одного занятия для указанной группы")
-            sys.exit(1)
+    logging.info("Загрузка расписания для группы: %s", args.group)
+    try:
+        with requests.Session() as session:
+            html = fetch_html(args.url, args.group, session)
+            if not html:
+                logging.error("Не удалось загрузить HTML расписания")
+                sys.exit(1)
+            
+            events = parse_schedule(html, session)
+            if not events:
+                logging.error("Не найдено ни одного занятия для указанной группы")
+                sys.exit(1)
 
-        build_ics(events, mobile_output, target="mobile")
-        build_ics(events, google_output, target="google")
-    logging.info("Сохранено занятий: %s", len(events))
-    logging.info("Файлы: мобильный=%s, google=%s", mobile_output, google_output)
+            build_ics(events, mobile_output, target="mobile")
+            build_ics(events, google_output, target="google")
+        
+        logging.info("Успешно загружено занятий: %s", len(events))
+        logging.info("Мобильный календарь: %s", mobile_output)
+        logging.info("Google Calendar: %s", google_output)
+    except Exception as exc:
+        logging.error("Критическая ошибка: %s", exc)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

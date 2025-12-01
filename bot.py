@@ -5,7 +5,9 @@ import asyncio
 import datetime as dt
 import logging
 import os
+import re
 import tempfile
+from io import BytesIO
 from pathlib import Path
 from typing import List, Tuple
 
@@ -24,7 +26,7 @@ from schedule_parser import (
     slugify_group_name,
 )
 
-TELEGRAM_TOKEN_ENV = "8304941548:AAHxseOjmhEv-U1Bfy7O1lWtLhlu2KlHYUE"
+TELEGRAM_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 DEFAULT_URL_ENV = "SCHEDULE_URL"
 DEFAULT_GROUP_ENV = "SCHEDULE_GROUP"
 BUTTON_TEXT_WEEKLY = "📅 Расписание недели"
@@ -76,16 +78,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not update.message:
         return
-    url, group = get_default_params()
-    await update.message.reply_text(
-        "Привет! Я бот для расписания. Доступные команды:\n"
-        "• /week [url] [group] — показать расписание недели текстом."
-        "\n• /ics [url] [group] — отправить .ics файлы (мобильный и Google)."
-        "\n• /plan <YYYY-MM-DD> <HH:MM> [url] [group] — запланировать отправку текста."
-        "\n• В группе можно написать: 'Бот, кинь расписание'."
-        f"\nТекущие значения по умолчанию: URL={url}, группа={group}",
-        reply_markup=REPLY_KEYBOARD,
-    )
+    try:
+        url, group = get_default_params()
+        await update.message.reply_text(
+            "Привет! Я бот для расписания. Доступные команды:\n"
+            "• /week [url] [group] — показать расписание недели текстом."
+            "\n• /ics [url] [group] — отправить .ics файлы (мобильный и Google)."
+            "\n• /plan <YYYY-MM-DD> <HH:MM> [url] [group] — запланировать отправку текста."
+            "\n• В группе можно написать: 'Бот, кинь расписание'."
+            f"\nТекущие значения по умолчанию: URL={url}, группа={group}",
+            reply_markup=REPLY_KEYBOARD,
+        )
+        logging.info("Пользователь запустил /start")
+    except Exception as exc:
+        logging.error("Ошибка при выполнении команды /start: %s", exc)
 
 
 async def send_schedule_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -94,26 +100,49 @@ async def send_schedule_files(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not update.message:
         return
     url, group = resolve_args(context)
-    events = await fetch_events_async(url, group)
+    try:
+        events = await fetch_events_async(url, group)
+    except Exception as exc:
+        logging.error("Ошибка загрузки событий: %s", exc)
+        await update.message.reply_text(
+            "Ошибка загрузки расписания. Попробуйте позже."
+        )
+        return
+    
     if not events:
         await update.message.reply_text(
             "Не удалось найти занятия для указанной группы. Проверьте URL и код группы."
         )
         return
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mobile_path = Path(tmpdir) / f"schedule_{slugify_group_name(group)}.ics"
-        google_path = Path(tmpdir) / f"schedule_{slugify_group_name(group)}_google.ics"
-        build_ics(events, mobile_path, target="mobile")
-        build_ics(events, google_path, target="google")
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mobile_path = Path(tmpdir) / f"schedule_{slugify_group_name(group)}.ics"
+            google_path = Path(tmpdir) / f"schedule_{slugify_group_name(group)}_google.ics"
+            build_ics(events, mobile_path, target="mobile")
+            build_ics(events, google_path, target="google")
 
+            # Читаем файлы в памяти перед удалением временной директории
+            with mobile_path.open("rb") as f:
+                mobile_data = f.read()
+            with google_path.open("rb") as f:
+                google_data = f.read()
+
+        # Отправляем после закрытия temp директории
+        from io import BytesIO
         await update.message.reply_document(
-            document=mobile_path.open("rb"),
+            document=BytesIO(mobile_data),
             filename=mobile_path.name,
         )
         await update.message.reply_document(
-            document=google_path.open("rb"),
+            document=BytesIO(google_data),
             filename=google_path.name,
+        )
+        logging.info("Файлы расписания отправлены для группы %s", group)
+    except Exception as exc:
+        logging.error("Ошибка при отправке файлов: %s", exc)
+        await update.message.reply_text(
+            "Ошибка при отправке файлов. Попробуйте позже."
         )
 
 
@@ -122,10 +151,20 @@ async def send_weekly_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if not update.message:
         return
-    url, group = resolve_args(context)
-    events = await fetch_events_async(url, group)
-    text = format_weekly_schedule(events)
-    await update.message.reply_text(text)
+    try:
+        url, group = resolve_args(context)
+        events = await fetch_events_async(url, group)
+        if not events:
+            text = "На эту неделю занятий не найдено или расписание недоступно."
+        else:
+            text = format_weekly_schedule(events)
+        await update.message.reply_text(text)
+        logging.info("Расписание недели отправлено для группы %s", group)
+    except Exception as exc:
+        logging.error("Ошибка при отправке расписания: %s", exc)
+        await update.message.reply_text(
+            "Ошибка при загрузке расписания. Попробуйте позже."
+        )
 
 
 async def plan_scheduled_text(
@@ -135,7 +174,7 @@ async def plan_scheduled_text(
 
     if not update.message:
         return
-    if len(context.args) < 2:
+    if not context.args or len(context.args) < 2:
         await update.message.reply_text(
             "Укажите дату и время: /schedule_plan YYYY-MM-DD HH:MM [url] [group]",
             reply_markup=REPLY_KEYBOARD,
@@ -159,29 +198,46 @@ async def plan_scheduled_text(
         return
 
     url, group = resolve_scheduled_args(rest)
-    job = context.job_queue.run_once(
-        send_scheduled_text,
-        when=run_at,
-        chat_id=update.effective_chat.id if update.effective_chat else None,
-        data={"url": url, "group": group, "reference_date": run_at.date()},
-        name=f"schedule-{update.effective_chat.id if update.effective_chat else 'chat'}",
-    )
-
-    if not job:
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    
+    if not chat_id:
         await update.message.reply_text(
-            "Не удалось запланировать отправку, попробуйте позже.",
+            "Не удалось определить chat_id.",
             reply_markup=REPLY_KEYBOARD,
         )
         return
+    
+    try:
+        job = context.job_queue.run_once(
+            send_scheduled_text,
+            when=run_at,
+            chat_id=chat_id,
+            data={"url": url, "group": group, "reference_date": run_at.date()},
+            name=f"schedule-{chat_id}",
+        )
 
-    await update.message.reply_text(
-        (
-            "Плановая отправка настроена. Расписание будет отправлено "
-            f"{run_at.strftime('%d.%m.%Y %H:%M %Z')} "
-            f"для группы {group} по адресу {url}."
-        ),
-        reply_markup=REPLY_KEYBOARD,
-    )
+        if not job:
+            await update.message.reply_text(
+                "Не удалось запланировать отправку, попробуйте позже.",
+                reply_markup=REPLY_KEYBOARD,
+            )
+            return
+
+        await update.message.reply_text(
+            (
+                "Плановая отправка настроена. Расписание будет отправлено "
+                f"{run_at.strftime('%d.%m.%Y %H:%M %Z')} "
+                f"для группы {group}."
+            ),
+            reply_markup=REPLY_KEYBOARD,
+        )
+        logging.info("Запланирована отправка для %s на %s", chat_id, run_at)
+    except Exception as exc:
+        logging.error("Ошибка при планировании отправки: %s", exc)
+        await update.message.reply_text(
+            "Ошибка при планировании отправки. Попробуйте позже.",
+            reply_markup=REPLY_KEYBOARD,
+        )
 
 
 async def send_scheduled_text(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -189,13 +245,27 @@ async def send_scheduled_text(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     job = context.job
     if not job or job.chat_id is None:
+        logging.warning("send_scheduled_text: job или chat_id не определены")
         return
-    url = job.data.get("url") if job.data else DEFAULT_URL
-    group = job.data.get("group") if job.data else DEFAULT_GROUP
-    reference_date = job.data.get("reference_date") if job.data else None
-    events = await fetch_events_async(url, group)
-    text = format_weekly_schedule(events, reference_date=reference_date)
-    await context.bot.send_message(chat_id=job.chat_id, text=text)
+    
+    try:
+        url = job.data.get("url") if job.data else DEFAULT_URL
+        group = job.data.get("group") if job.data else DEFAULT_GROUP
+        reference_date = job.data.get("reference_date") if job.data else None
+        
+        events = await fetch_events_async(url, group)
+        text = format_weekly_schedule(events, reference_date=reference_date)
+        await context.bot.send_message(chat_id=job.chat_id, text=text)
+        logging.info("Плановое расписание отправлено в %s", job.chat_id)
+    except Exception as exc:
+        logging.error("Ошибка при отправке плановой рассылки: %s", exc)
+        try:
+            await context.bot.send_message(
+                chat_id=job.chat_id,
+                text="Ошибка при загрузке расписания. Попробуйте позже."
+            )
+        except Exception as err:
+            logging.error("Ошибка при отправке сообщения об ошибке: %s", err)
 
 
 async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -265,7 +335,7 @@ def resolve_args(context: ContextTypes.DEFAULT_TYPE) -> Tuple[str, str]:
     """Определяет URL и код группы из аргументов команды или окружения."""
 
     url_default, group_default = get_default_params()
-    args = context.args
+    args = context.args or []
     if not args:
         return url_default, group_default
     if len(args) == 1:
@@ -298,13 +368,21 @@ def parse_schedule_datetime(date_arg: str, time_arg: str) -> dt.datetime | None:
 async def fetch_events_async(url: str, group: str) -> List[ScheduleEvent]:
     """Получает события в отдельном потоке, чтобы не блокировать бота."""
 
+    if not url or not group:
+        logging.warning("fetch_events_async: пустые url или group")
+        return []
+    
     def _load() -> List[ScheduleEvent]:
-        with requests.Session() as session:
-            return fetch_events(url, group, session)
+        try:
+            with requests.Session() as session:
+                return fetch_events(url, group, session)
+        except Exception as exc:
+            logging.error("Ошибка в потоке загрузки: %s", exc)
+            return []
 
     try:
         return await asyncio.to_thread(_load)
-    except Exception as exc:  # pragma: no cover - защита от неожиданных сбоев
+    except Exception as exc:
         logging.error("Не удалось загрузить расписание: %s", exc)
         return []
 
@@ -313,31 +391,40 @@ def build_application(token: str) -> Application:
     """Создаёт экземпляр Application с зарегистрированными хендлерами."""
 
     application = Application.builder().token(token).post_init(setup_bot_commands).build()
+    
+    # Регистрируем хендлеры команд
     application.add_handler(CommandHandler(["start", "help"], start))
     application.add_handler(CommandHandler(["schedule_files", "ics"], send_schedule_files))
     application.add_handler(CommandHandler(["schedule_text", "week"], send_weekly_text))
     application.add_handler(CommandHandler(["schedule_plan", "plan"], plan_scheduled_text))
+    
+    # Хендлер для кнопок меню
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & filters.Regex(
+                f"^({re.escape(BUTTON_TEXT_WEEKLY)}|{re.escape(BUTTON_TEXT_ICS)}|{re.escape(BUTTON_TEXT_PLAN)})$"
+            ),
+            handle_menu_buttons,
+        )
+    )
+    
+    # Хендлер для приватных сообщений
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
             handle_private_text,
         )
     )
+    
+    # Хендлер для групповых сообщений
     application.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
             handle_group_text,
         )
     )
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT
-            & filters.Regex(
-                f"^({BUTTON_TEXT_WEEKLY}|{BUTTON_TEXT_ICS}|{BUTTON_TEXT_PLAN})$"
-            ),
-            handle_menu_buttons,
-        )
-    )
+    
     return application
 
 
@@ -352,10 +439,18 @@ def main() -> None:
             f"Не задан токен. Установите переменную {TELEGRAM_TOKEN_ENV}="
             "<telegram_bot_token>"
         )
+        logging.error(msg)
         raise SystemExit(msg)
 
-    application = build_application(token)
-    application.run_polling(drop_pending_updates=True)
+    logging.info("Запуск Telegram-бота...")
+    try:
+        application = build_application(token)
+        application.run_polling(drop_pending_updates=True)
+    except KeyboardInterrupt:
+        logging.info("Бот остановлен пользователем")
+    except Exception as exc:
+        logging.error("Критическая ошибка: %s", exc)
+        raise
 
 
 if __name__ == "__main__":
