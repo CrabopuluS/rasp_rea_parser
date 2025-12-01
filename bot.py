@@ -446,10 +446,9 @@ async def main() -> None:
     application: Application | None = None
     try:
         application = build_application(token)
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling(drop_pending_updates=True)
-        await application.wait_until_closed()
+        await asyncio.to_thread(
+            application.run_polling, drop_pending_updates=True
+        )
     except KeyboardInterrupt:
         logging.info("Бот остановлен пользователем")
     except Exception as exc:
