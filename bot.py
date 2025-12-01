@@ -444,6 +444,11 @@ def main() -> None:
 
     logging.info("Запуск Telegram-бота...")
     try:
+        # Python 3.12+ не создаёт event loop по умолчанию; задаём его явно,
+        # чтобы telegram-бот корректно запускал внутренние корутины.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
         application = build_application(token)
         application.run_polling(drop_pending_updates=True)
     except KeyboardInterrupt:
