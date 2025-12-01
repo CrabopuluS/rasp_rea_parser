@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 import requests
-from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram import BotCommand, KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from schedule_parser import (
@@ -30,6 +30,13 @@ DEFAULT_GROUP_ENV = "SCHEDULE_GROUP"
 BUTTON_TEXT_WEEKLY = "📅 Расписание недели"
 BUTTON_TEXT_ICS = "📂 Получить .ics"
 BUTTON_TEXT_PLAN = "⏰ Запланировать отправку"
+TRIGGER_KEYWORDS = (
+    "бот, кинь расписание",
+    "бот кинь расписание",
+    "бот, дай расписание",
+    "бот дай расписание",
+    "бот покажи расписание",
+)
 REPLY_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton(BUTTON_TEXT_WEEKLY), KeyboardButton(BUTTON_TEXT_ICS)],
@@ -54,12 +61,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     url, group = get_default_params()
     await update.message.reply_text(
-        "Доступные команды:\n"
-        "• /ics [url] [group] — отправить два .ics файла (мобильный и Google)."\
-        "\n• /week [url] [group] — показать расписание недели текстом."\
-        "\n• /plan <YYYY-MM-DD> <HH:MM> [url] [group] — запланировать отправку текста."\
-        "\n• Просто напишите боту любое сообщение в личке — он вернет расписание."
-        f"Текущие значения по умолчанию: URL={url}, группа={group}",
+        "Привет! Я бот для расписания. Доступные команды:\n"
+        "• /week [url] [group] — показать расписание недели текстом."
+        "\n• /ics [url] [group] — отправить .ics файлы (мобильный и Google)."
+        "\n• /plan <YYYY-MM-DD> <HH:MM> [url] [group] — запланировать отправку текста."
+        "\n• В группе можно написать: 'Бот, кинь расписание'."
+        f"\nТекущие значения по умолчанию: URL={url}, группа={group}",
         reply_markup=REPLY_KEYBOARD,
     )
 
@@ -189,6 +196,29 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 
+def is_schedule_request(text: str, bot_username: str | None) -> bool:
+    """Проверяет, содержит ли сообщение запрос расписания."""
+
+    normalized = text.lower()
+    if bot_username and f"@{bot_username.lower()}" in normalized:
+        return True
+    if "распис" in normalized:
+        return True
+    return any(keyword in normalized for keyword in TRIGGER_KEYWORDS)
+
+
+async def setup_bot_commands(application: Application) -> None:
+    """Регистрирует команды в меню бота."""
+
+    commands = [
+        BotCommand("start", "Вступление и примеры команд"),
+        BotCommand("week", "Расписание недели текстом"),
+        BotCommand("ics", "Скачать .ics файлы"),
+        BotCommand("plan", "Запланировать отправку расписания"),
+    ]
+    await application.bot.set_my_commands(commands)
+
+
 async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отвечает на произвольные сообщения в личных чатах расписанием или файлами."""
 
@@ -208,39 +238,8 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     text = update.message.text.lower()
     bot_username = (context.bot.username or "").lower()
-    if "распис" in text or (bot_username and f"@{bot_username}" in text):
+    if is_schedule_request(text, bot_username):
         await send_weekly_text(update, context)
-
-
-async def send_scheduled_text(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Колбек для отложенной отправки текстового расписания."""
-
-    job = context.job
-    if not job or job.chat_id is None:
-        return
-    url = job.data.get("url") if job.data else DEFAULT_URL
-    group = job.data.get("group") if job.data else DEFAULT_GROUP
-    reference_date = job.data.get("reference_date") if job.data else None
-    events = await fetch_events_async(url, group)
-    text = format_weekly_schedule(events, reference_date=reference_date)
-    await context.bot.send_message(chat_id=job.chat_id, text=text)
-
-
-async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает нажатия кнопок основного меню."""
-
-    if not update.message:
-        return
-    if update.message.text == BUTTON_TEXT_WEEKLY:
-        await send_weekly_text(update, context)
-    elif update.message.text == BUTTON_TEXT_ICS:
-        await send_schedule_files(update, context)
-    elif update.message.text == BUTTON_TEXT_PLAN:
-        await update.message.reply_text(
-            "Используйте команду /schedule_plan <YYYY-MM-DD> <HH:MM> [url] [group]"
-            " для плановой отправки текстового расписания. Время — московское.",
-            reply_markup=REPLY_KEYBOARD,
-        )
 
 
 def resolve_args(context: ContextTypes.DEFAULT_TYPE) -> Tuple[str, str]:
@@ -290,7 +289,7 @@ async def fetch_events_async(url: str, group: str) -> List[ScheduleEvent]:
 def build_application(token: str) -> Application:
     """Создаёт экземпляр Application с зарегистрированными хендлерами."""
 
-    application = Application.builder().token(token).build()
+    application = Application.builder().token(token).post_init(setup_bot_commands).build()
     application.add_handler(CommandHandler(["start", "help"], start))
     application.add_handler(CommandHandler(["schedule_files", "ics"], send_schedule_files))
     application.add_handler(CommandHandler(["schedule_text", "week"], send_weekly_text))
@@ -305,15 +304,6 @@ def build_application(token: str) -> Application:
         MessageHandler(
             filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
             handle_group_text,
-        )
-    )
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT
-            & filters.Regex(
-                f"^({BUTTON_TEXT_WEEKLY}|{BUTTON_TEXT_ICS}|{BUTTON_TEXT_PLAN})$"
-            ),
-            handle_menu_buttons,
         )
     )
     application.add_handler(
