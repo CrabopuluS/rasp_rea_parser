@@ -334,14 +334,7 @@ def fetch_details(
     except Exception as exc:
         logging.warning("Ошибка при парсинге деталей: %s", exc)
         return None, None
-    
-    if not body:
-        return None, None
 
-    lines = [line.strip() for line in body.get_text("\n").splitlines() if line.strip()]
-    teacher = extract_teacher(lines)
-    extra_info = extract_extra_info(lines)
-    return teacher, extra_info
     if not body:
         return None, None
 
