@@ -2,7 +2,8 @@
 Парсер расписания РЭУ им. Г.В. Плеханова для выгрузки занятий в .ics календарь.
 
 Зависимости (pip):
-    pip install requests beautifulsoup4 pytz
+    pip install requests beautifulsoup4 tzdata
+    pip install pytz  # для Python < 3.9
 
 Пример запуска:
     python schedule_parser.py \
@@ -26,17 +27,39 @@ import requests
 from bs4 import BeautifulSoup
 
 try:  # Python 3.9+
-    from zoneinfo import ZoneInfo
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 except ImportError:  # pragma: no cover - fallback for older Python
     from pytz import timezone as ZoneInfo  # type: ignore
+    ZoneInfoNotFoundError = Exception  # type: ignore
 
 DEFAULT_URL = "https://rasp.rea.ru/?q=15.14%D0%B4-%D0%B3%D0%B301%2F24%D0%BC"
 DEFAULT_GROUP = "15.14д-гг01/24м"
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 REQUEST_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
     "Referer": "https://rasp.rea.ru/",
 }
+
+
+def load_moscow_tz() -> dt.tzinfo:
+    """Возвращает временную зону Москвы с запасным вариантом.
+
+    На Windows может отсутствовать системная база IANA. В этом случае
+    используем фиксированный UTC+3 и выводим предупреждение. Для
+    корректных переходов на летнее время рекомендуется установить
+    дополнительный пакет `tzdata` (см. зависимостей в шапке).
+    """
+
+    try:
+        return ZoneInfo("Europe/Moscow")
+    except ZoneInfoNotFoundError:
+        logging.warning(
+            "Не найден часовой пояс Europe/Moscow. Используем фиксированный UTC+3. "
+            "Установите пакет 'tzdata' для полной поддержки.",
+        )
+        return dt.timezone(dt.timedelta(hours=3), name="Europe/Moscow")
+
+
+MOSCOW_TZ = load_moscow_tz()
 
 
 @dataclass

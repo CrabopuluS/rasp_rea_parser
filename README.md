@@ -12,3 +12,9 @@ python schedule_parser.py \
 ```
 
 Флаги `--url`, `--group` и `--output` имеют значения по умолчанию и могут не указываться.
+
+## Зависимости
+
+```bash
+pip install requests beautifulsoup4 tzdata  # tzdata обязательно на Windows
+```
