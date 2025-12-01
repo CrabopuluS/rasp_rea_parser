@@ -443,6 +443,7 @@ async def main() -> None:
         raise SystemExit(msg)
 
     logging.info("Запуск Telegram-бота...")
+    application: Application | None = None
     try:
         application = build_application(token)
         await application.initialize()
@@ -457,6 +458,11 @@ async def main() -> None:
     except Exception as exc:
         logging.error("Критическая ошибка: %s", exc)
         raise
+    finally:
+        if application:
+            await application.updater.stop()
+            await application.stop()
+            await application.shutdown()
 
 
 if __name__ == "__main__":
