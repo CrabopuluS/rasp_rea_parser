@@ -55,12 +55,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     url, group = get_default_params()
     await update.message.reply_text(
         "Доступные команды:\n"
-        "• /schedule_files [url] [group] — отправить два .ics файла."\
-        " Если параметры не переданы, используется URL по умолчанию."\
-        "\n• /schedule_text [url] [group] — показать расписание недели текстом."\
-        "\n• /schedule_plan <YYYY-MM-DD> <HH:MM> [url] [group] —"\
-        " запланировать отправку расписания на указанную дату и время."\
-        "\n• Сообщение с текстом ‘расписание’ — покажет расписание недели.\n"
+        "• /ics [url] [group] — отправить два .ics файла (мобильный и Google)."\
+        "\n• /week [url] [group] — показать расписание недели текстом."\
+        "\n• /plan <YYYY-MM-DD> <HH:MM> [url] [group] — запланировать отправку текста."\
+        "\n• Просто напишите боту любое сообщение в личке — он вернет расписание."
         f"Текущие значения по умолчанию: URL={url}, группа={group}",
         reply_markup=REPLY_KEYBOARD,
     )
@@ -160,10 +158,58 @@ async def plan_scheduled_text(
     )
 
 
-async def reply_on_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Реагирует на упоминание слова 'расписание' в группе."""
+async def send_scheduled_text(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Колбек для отложенной отправки текстового расписания."""
 
-    await send_weekly_text(update, context)
+    job = context.job
+    if not job or job.chat_id is None:
+        return
+    url = job.data.get("url") if job.data else DEFAULT_URL
+    group = job.data.get("group") if job.data else DEFAULT_GROUP
+    reference_date = job.data.get("reference_date") if job.data else None
+    events = await fetch_events_async(url, group)
+    text = format_weekly_schedule(events, reference_date=reference_date)
+    await context.bot.send_message(chat_id=job.chat_id, text=text)
+
+
+async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает нажатия кнопок основного меню."""
+
+    if not update.message:
+        return
+    if update.message.text == BUTTON_TEXT_WEEKLY:
+        await send_weekly_text(update, context)
+    elif update.message.text == BUTTON_TEXT_ICS:
+        await send_schedule_files(update, context)
+    elif update.message.text == BUTTON_TEXT_PLAN:
+        await update.message.reply_text(
+            "Используйте команду /schedule_plan <YYYY-MM-DD> <HH:MM> [url] [group]"
+            " для плановой отправки текстового расписания. Время — московское.",
+            reply_markup=REPLY_KEYBOARD,
+        )
+
+
+async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отвечает на произвольные сообщения в личных чатах расписанием или файлами."""
+
+    if not update.message:
+        return
+    text = update.message.text.lower()
+    if "ics" in text or "файл" in text or ".ics" in text:
+        await send_schedule_files(update, context)
+    else:
+        await send_weekly_text(update, context)
+
+
+async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отвечает на упоминания или запросы в групповых чатах."""
+
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.lower()
+    bot_username = (context.bot.username or "").lower()
+    if "распис" in text or (bot_username and f"@{bot_username}" in text):
+        await send_weekly_text(update, context)
 
 
 async def send_scheduled_text(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -248,11 +294,26 @@ def build_application(token: str) -> Application:
     application.add_handler(CommandHandler(["start", "help"], start))
     application.add_handler(CommandHandler(["schedule_files", "ics"], send_schedule_files))
     application.add_handler(CommandHandler(["schedule_text", "week"], send_weekly_text))
-    application.add_handler(CommandHandler("schedule_plan", plan_scheduled_text))
+    application.add_handler(CommandHandler(["schedule_plan", "plan"], plan_scheduled_text))
     application.add_handler(
         MessageHandler(
-            filters.TEXT & filters.Regex("(?i)расписание"),
-            reply_on_keyword,
+            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+            handle_private_text,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
+            handle_group_text,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & filters.Regex(
+                f"^({BUTTON_TEXT_WEEKLY}|{BUTTON_TEXT_ICS}|{BUTTON_TEXT_PLAN})$"
+            ),
+            handle_menu_buttons,
         )
     )
     application.add_handler(
