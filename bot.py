@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import os
 import tempfile
@@ -9,12 +10,13 @@ from pathlib import Path
 from typing import List, Tuple
 
 import requests
-from telegram import Update
+from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from schedule_parser import (
     DEFAULT_GROUP,
     DEFAULT_URL,
+    MOSCOW_TZ,
     ScheduleEvent,
     build_ics,
     fetch_events,
@@ -25,6 +27,16 @@ from schedule_parser import (
 TELEGRAM_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 DEFAULT_URL_ENV = "SCHEDULE_URL"
 DEFAULT_GROUP_ENV = "SCHEDULE_GROUP"
+BUTTON_TEXT_WEEKLY = "📅 Расписание недели"
+BUTTON_TEXT_ICS = "📂 Получить .ics"
+BUTTON_TEXT_PLAN = "⏰ Запланировать отправку"
+REPLY_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton(BUTTON_TEXT_WEEKLY), KeyboardButton(BUTTON_TEXT_ICS)],
+        [KeyboardButton(BUTTON_TEXT_PLAN)],
+    ],
+    resize_keyboard=True,
+)
 
 
 def get_default_params() -> Tuple[str, str]:
@@ -46,8 +58,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /schedule_files [url] [group] — отправить два .ics файла."\
         " Если параметры не переданы, используется URL по умолчанию."\
         "\n• /schedule_text [url] [group] — показать расписание недели текстом."\
+        "\n• /schedule_plan <YYYY-MM-DD> <HH:MM> [url] [group] —"\
+        " запланировать отправку расписания на указанную дату и время."\
         "\n• Сообщение с текстом ‘расписание’ — покажет расписание недели.\n"
-        f"Текущие значения по умолчанию: URL={url}, группа={group}"
+        f"Текущие значения по умолчанию: URL={url}, группа={group}",
+        reply_markup=REPLY_KEYBOARD,
     )
 
 
@@ -89,10 +104,97 @@ async def send_weekly_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text(text)
 
 
+async def plan_scheduled_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Планирует отправку расписания на заданные дату и время (МСК)."""
+
+    if not update.message:
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Укажите дату и время: /schedule_plan YYYY-MM-DD HH:MM [url] [group]",
+            reply_markup=REPLY_KEYBOARD,
+        )
+        return
+
+    date_arg, time_arg, *rest = context.args
+    run_at = parse_schedule_datetime(date_arg, time_arg)
+    if not run_at:
+        await update.message.reply_text(
+            "Неверный формат. Дата YYYY-MM-DD, время HH:MM (24ч).",
+            reply_markup=REPLY_KEYBOARD,
+        )
+        return
+    now = dt.datetime.now(tz=MOSCOW_TZ)
+    if run_at <= now:
+        await update.message.reply_text(
+            "Время должно быть в будущем относительно московского времени.",
+            reply_markup=REPLY_KEYBOARD,
+        )
+        return
+
+    url, group = resolve_scheduled_args(rest)
+    job = context.job_queue.run_once(
+        send_scheduled_text,
+        when=run_at,
+        chat_id=update.effective_chat.id if update.effective_chat else None,
+        data={"url": url, "group": group, "reference_date": run_at.date()},
+        name=f"schedule-{update.effective_chat.id if update.effective_chat else 'chat'}",
+    )
+
+    if not job:
+        await update.message.reply_text(
+            "Не удалось запланировать отправку, попробуйте позже.",
+            reply_markup=REPLY_KEYBOARD,
+        )
+        return
+
+    await update.message.reply_text(
+        (
+            "Плановая отправка настроена. Расписание будет отправлено "
+            f"{run_at.strftime('%d.%m.%Y %H:%M %Z')} "
+            f"для группы {group} по адресу {url}."
+        ),
+        reply_markup=REPLY_KEYBOARD,
+    )
+
+
 async def reply_on_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Реагирует на упоминание слова 'расписание' в группе."""
 
     await send_weekly_text(update, context)
+
+
+async def send_scheduled_text(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Колбек для отложенной отправки текстового расписания."""
+
+    job = context.job
+    if not job or job.chat_id is None:
+        return
+    url = job.data.get("url") if job.data else DEFAULT_URL
+    group = job.data.get("group") if job.data else DEFAULT_GROUP
+    reference_date = job.data.get("reference_date") if job.data else None
+    events = await fetch_events_async(url, group)
+    text = format_weekly_schedule(events, reference_date=reference_date)
+    await context.bot.send_message(chat_id=job.chat_id, text=text)
+
+
+async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает нажатия кнопок основного меню."""
+
+    if not update.message:
+        return
+    if update.message.text == BUTTON_TEXT_WEEKLY:
+        await send_weekly_text(update, context)
+    elif update.message.text == BUTTON_TEXT_ICS:
+        await send_schedule_files(update, context)
+    elif update.message.text == BUTTON_TEXT_PLAN:
+        await update.message.reply_text(
+            "Используйте команду /schedule_plan <YYYY-MM-DD> <HH:MM> [url] [group]"
+            " для плановой отправки текстового расписания. Время — московское.",
+            reply_markup=REPLY_KEYBOARD,
+        )
 
 
 def resolve_args(context: ContextTypes.DEFAULT_TYPE) -> Tuple[str, str]:
@@ -105,6 +207,28 @@ def resolve_args(context: ContextTypes.DEFAULT_TYPE) -> Tuple[str, str]:
     if len(args) == 1:
         return args[0], group_default
     return args[0], args[1]
+
+
+def resolve_scheduled_args(args: List[str]) -> Tuple[str, str]:
+    """Определяет URL и группу для запланированной отправки."""
+
+    url_default, group_default = get_default_params()
+    if not args:
+        return url_default, group_default
+    if len(args) == 1:
+        return args[0], group_default
+    return args[0], args[1]
+
+
+def parse_schedule_datetime(date_arg: str, time_arg: str) -> dt.datetime | None:
+    """Парсит дату и время (МСК) из аргументов команды."""
+
+    try:
+        date_part = dt.datetime.strptime(date_arg, "%Y-%m-%d").date()
+        time_part = dt.datetime.strptime(time_arg, "%H:%M").time()
+    except ValueError:
+        return None
+    return dt.datetime.combine(date_part, time_part, tzinfo=MOSCOW_TZ)
 
 
 async def fetch_events_async(url: str, group: str) -> List[ScheduleEvent]:
@@ -124,10 +248,20 @@ def build_application(token: str) -> Application:
     application.add_handler(CommandHandler(["start", "help"], start))
     application.add_handler(CommandHandler(["schedule_files", "ics"], send_schedule_files))
     application.add_handler(CommandHandler(["schedule_text", "week"], send_weekly_text))
+    application.add_handler(CommandHandler("schedule_plan", plan_scheduled_text))
     application.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex("(?i)расписание"),
             reply_on_keyword,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & filters.Regex(
+                f"^({BUTTON_TEXT_WEEKLY}|{BUTTON_TEXT_ICS}|{BUTTON_TEXT_PLAN})$"
+            ),
+            handle_menu_buttons,
         )
     )
     return application
