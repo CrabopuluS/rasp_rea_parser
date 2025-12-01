@@ -39,6 +39,24 @@ REQUEST_HEADERS = {
     "Referer": "https://rasp.rea.ru/",
 }
 
+SUBJECT_SHORTCUTS = {
+    "Организация предоставления государственных услуг": "ОПГУ",
+    "Организация экспертных, общественных советов, проведение экспертиз": "ОргСоветов",
+    "Партийно-политические элиты и электоральные процессы": "ППЭЭП",
+    "Репутационный менеджмент в государственном управлении": "РМГУ",
+    "Политическая имиджелогия": "ПИ",
+    "Кризис-менеджмент: лидерство в условиях кризиса или конфликта": "КМ",
+    "Общественное мнение и политическое лидерство": "ОМПЛ",
+    "Технологии государственного контроля и аудита": "ТГКА",
+    "Проектное управление в государственном секторе": "ПУГС",
+}
+
+GOOGLE_COLOR_MAP = {
+    "seminar": "#F4511E",  # tangerine
+    "lecture": "#F6BF26",  # banana
+    "exam": "#D50000",  # tomato
+}
+
 
 def load_moscow_tz() -> dt.tzinfo:
     """Возвращает временную зону Москвы с запасным вариантом.
@@ -75,6 +93,7 @@ class ScheduleEvent:
     location: Optional[str] = None
     extra_info: Optional[str] = None
     element_id: Optional[str] = None
+    pair_number: Optional[int] = None
 
 
 def fetch_html(url: str, group: str, session: requests.Session) -> str:
@@ -179,7 +198,7 @@ def build_event_from_row(
     if not row:
         return None
     time_cell = row.find("td")
-    start_time, end_time = parse_timeslot(time_cell)
+    start_time, end_time, pair_number = parse_timeslot(time_cell)
     if not start_time or not end_time:
         logging.info("Пропускаем строку без времени: %s", anchor.get_text(strip=True))
         return None
@@ -202,23 +221,41 @@ def build_event_from_row(
         location=location,
         extra_info=extra_info,
         element_id=anchor.get("data-elementid"),
+        pair_number=pair_number,
     )
 
 
-def parse_timeslot(cell: Optional[BeautifulSoup]) -> Tuple[Optional[dt.time], Optional[dt.time]]:
-    """Разбирает ячейку времени: ожидается номер пары, время начала и конца."""
+def parse_timeslot(
+    cell: Optional[BeautifulSoup],
+) -> Tuple[Optional[dt.time], Optional[dt.time], Optional[int]]:
+    """Разбирает ячейку времени: номер пары, время начала и конца."""
 
     if not cell:
-        return None, None
-    parts = [part for part in cell.stripped_strings if not part.endswith("пара")]
-    if len(parts) < 2:
-        return None, None
+        return None, None, None
+    parts = list(cell.stripped_strings)
+    pair_number = extract_pair_number(parts)
+    time_parts = [part for part in parts if not part.endswith("пара")]
+    if len(time_parts) < 2:
+        return None, None, pair_number
     try:
-        start_time = dt.datetime.strptime(parts[0], "%H:%M").time()
-        end_time = dt.datetime.strptime(parts[1], "%H:%M").time()
+        start_time = dt.datetime.strptime(time_parts[0], "%H:%M").time()
+        end_time = dt.datetime.strptime(time_parts[1], "%H:%M").time()
     except ValueError:
-        return None, None
-    return start_time, end_time
+        return None, None, pair_number
+    return start_time, end_time, pair_number
+
+
+def extract_pair_number(parts: List[str]) -> Optional[int]:
+    """Извлекает порядковый номер пары из сырой ячейки времени."""
+
+    for part in parts:
+        match = re.search(r"(\d+)\s*пара", part)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
+    return None
 
 
 def clean_location(chunks: Iterable[str]) -> str:
@@ -279,6 +316,71 @@ def extract_extra_info(lines: List[str]) -> Optional[str]:
     return ", ".join(extras) if extras else None
 
 
+def build_event_summary(
+    event: ScheduleEvent, lesson_counters: dict[str, int]
+) -> Tuple[str, str]:
+    """Формирует название события и цвет по правилам Google Calendar."""
+
+    lesson_kind = detect_lesson_kind(event.lesson_type)
+    letter = resolve_lesson_letter(event.lesson_type, lesson_kind)
+    lesson_counters[letter] = lesson_counters.get(letter, 0) + 1
+    shortcut = SUBJECT_SHORTCUTS.get(event.title, event.title)
+    summary = f"{letter}{lesson_counters[letter]} {shortcut}"
+    color = GOOGLE_COLOR_MAP.get(lesson_kind, "")
+    return summary, color
+
+
+def detect_lesson_kind(lesson_type: Optional[str]) -> str:
+    """Определяет категорию занятия для цвета и буквенного кода."""
+
+    if not lesson_type:
+        return "other"
+    normalized = lesson_type.lower()
+    if "лекц" in normalized:
+        return "lecture"
+    if "практичес" in normalized or "лаборатор" in normalized:
+        return "seminar"
+    if "зач" in normalized or "экзам" in normalized:
+        return "exam"
+    return "other"
+
+
+def resolve_lesson_letter(lesson_type: Optional[str], lesson_kind: str) -> str:
+    """Возвращает буквенный код занятия (Л, С, Э, З, прочие)."""
+
+    if not lesson_type:
+        return "Д"
+    normalized = lesson_type.lower()
+    if lesson_kind == "lecture":
+        return "Л"
+    if lesson_kind == "seminar":
+        return "С"
+    if "экзам" in normalized:
+        return "Э"
+    if "зач" in normalized:
+        return "З"
+    return lesson_type[0].upper()
+
+
+def build_event_alarms(pair_number: Optional[int]) -> List[str]:
+    """Создает блоки напоминаний с учетом номера пары."""
+
+    reminders = [-10] if pair_number in {2, 3} else [-70, -10]
+    alarms: List[str] = []
+    for minutes in reminders:
+        trigger = f"-PT{abs(minutes)}M"
+        alarms.extend(
+            [
+                "BEGIN:VALARM",
+                "ACTION:DISPLAY",
+                f"TRIGGER:{trigger}",
+                "DESCRIPTION:Напоминание",
+                "END:VALARM",
+            ]
+        )
+    return alarms
+
+
 def build_ics(events: List[ScheduleEvent], output_path: Path) -> None:
     """Создает .ics файл со списком занятий."""
 
@@ -301,10 +403,11 @@ def build_ics(events: List[ScheduleEvent], output_path: Path) -> None:
         "END:VTIMEZONE",
     ]
 
+    lesson_counters: dict[str, int] = {}
     for event in sorted(events, key=lambda e: (e.date, e.start_time)):
         dt_start = dt.datetime.combine(event.date, event.start_time, tzinfo=MOSCOW_TZ)
         dt_end = dt.datetime.combine(event.date, event.end_time, tzinfo=MOSCOW_TZ)
-        summary = event.title if not event.lesson_type else f"{event.title} ({event.lesson_type})"
+        summary, color = build_event_summary(event, lesson_counters)
         description_parts = []
         if event.teacher:
             description_parts.append(f"Преподаватель: {event.teacher}")
@@ -313,19 +416,22 @@ def build_ics(events: List[ScheduleEvent], output_path: Path) -> None:
         if event.extra_info:
             description_parts.append(event.extra_info)
         description = "\n".join(description_parts)
+        alarms = build_event_alarms(event.pair_number)
 
-        lines.extend(
-            [
-                "BEGIN:VEVENT",
-                f"UID:{event.element_id or hash(summary + str(dt_start))}@rasp.rea.ru",
-                f"SUMMARY:{escape_ics(summary)}",
-                f"DTSTART;TZID=Europe/Moscow:{dt_start.strftime('%Y%m%dT%H%M%S')}",
-                f"DTEND;TZID=Europe/Moscow:{dt_end.strftime('%Y%m%dT%H%M%S')}",
-                f"DESCRIPTION:{escape_ics(description)}",
-                f"LOCATION:{escape_ics(event.location or '')}",
-                "END:VEVENT",
-            ]
-        )
+        event_block = [
+            "BEGIN:VEVENT",
+            f"UID:{event.element_id or hash(summary + str(dt_start))}@rasp.rea.ru",
+            f"SUMMARY:{escape_ics(summary)}",
+            f"DTSTART;TZID=Europe/Moscow:{dt_start.strftime('%Y%m%dT%H%M%S')}",
+            f"DTEND;TZID=Europe/Moscow:{dt_end.strftime('%Y%m%dT%H%M%S')}",
+            f"DESCRIPTION:{escape_ics(description)}",
+            f"LOCATION:{escape_ics(event.location or '')}",
+        ]
+        if color:
+            event_block.append(f"COLOR:{color}")
+        event_block.extend(alarms)
+        event_block.append("END:VEVENT")
+        lines.extend(event_block)
 
     lines.append("END:VCALENDAR")
     output_path.write_text("\n".join(lines), encoding="utf-8")
