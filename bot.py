@@ -450,19 +450,17 @@ async def main() -> None:
         await application.start()
         await application.bot.delete_webhook(drop_pending_updates=True)
         await application.updater.start_polling()
-        await application.updater.wait_for_stop()
-        await application.stop()
-        await application.shutdown()
+        # Блокируемся, пока не придет сигнал завершения (Ctrl+C)
+        await asyncio.Event().wait()
     except KeyboardInterrupt:
         logging.info("Бот остановлен пользователем")
     except Exception as exc:
         logging.error("Критическая ошибка: %s", exc)
         raise
     finally:
-        if application:
-            await application.updater.stop()
-            await application.stop()
-            await application.shutdown()
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
 
 
 if __name__ == "__main__":
