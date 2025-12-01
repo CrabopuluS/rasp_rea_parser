@@ -46,6 +46,23 @@ REPLY_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 
+def load_env_file(env_path: Path = Path(".env")) -> None:
+    """Загружает пары ключ=значение из локального .env без дополнительных зависимостей."""
+
+    if not env_path.exists():
+        return
+
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            logging.debug("Пропускаем строку без '=' в .env: %s", stripped)
+            continue
+        key, value = stripped.split("=", maxsplit=1)
+        os.environ.setdefault(key.strip(), value.strip())
+
+
 def get_default_params() -> Tuple[str, str]:
     """Возвращает URL и группу из переменных окружения или значений по умолчанию."""
 
@@ -79,7 +96,9 @@ async def send_schedule_files(update: Update, context: ContextTypes.DEFAULT_TYPE
     url, group = resolve_args(context)
     events = await fetch_events_async(url, group)
     if not events:
-        await update.message.reply_text("Не удалось найти занятия для указанной группы.")
+        await update.message.reply_text(
+            "Не удалось найти занятия для указанной группы. Проверьте URL и код группы."
+        )
         return
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -283,7 +302,11 @@ async def fetch_events_async(url: str, group: str) -> List[ScheduleEvent]:
         with requests.Session() as session:
             return fetch_events(url, group, session)
 
-    return await asyncio.to_thread(_load)
+    try:
+        return await asyncio.to_thread(_load)
+    except Exception as exc:  # pragma: no cover - защита от неожиданных сбоев
+        logging.error("Не удалось загрузить расписание: %s", exc)
+        return []
 
 
 def build_application(token: str) -> Application:
@@ -318,9 +341,10 @@ def build_application(token: str) -> Application:
     return application
 
 
-def main() -> None:
+async def main() -> None:
     """Точка входа для запуска бота."""
 
+    load_env_file()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     token = os.getenv(TELEGRAM_TOKEN_ENV)
     if not token:
@@ -331,14 +355,8 @@ def main() -> None:
         raise SystemExit(msg)
 
     application = build_application(token)
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        application.run_polling()
-    finally:
-        loop.close()
+    await application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
