@@ -146,7 +146,13 @@ def main() -> None:
         raise SystemExit(msg)
 
     application = build_application(token)
-    application.run_polling()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        application.run_polling()
+    finally:
+        loop.close()
 
 
 if __name__ == "__main__":
