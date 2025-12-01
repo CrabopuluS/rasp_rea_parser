@@ -428,7 +428,7 @@ def build_application(token: str) -> Application:
     return application
 
 
-def main() -> None:
+async def main() -> None:
     """Точка входа для запуска бота."""
 
     load_env_file()
@@ -444,13 +444,10 @@ def main() -> None:
 
     logging.info("Запуск Telegram-бота...")
     try:
-        # Python 3.12+ не создаёт event loop по умолчанию; задаём его явно,
-        # чтобы telegram-бот корректно запускал внутренние корутины.
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
         application = build_application(token)
-        application.run_polling(drop_pending_updates=True)
+        await asyncio.to_thread(
+            application.run_polling, drop_pending_updates=True
+        )
     except KeyboardInterrupt:
         logging.info("Бот остановлен пользователем")
     except Exception as exc:
@@ -459,4 +456,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
