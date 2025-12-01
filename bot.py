@@ -24,7 +24,7 @@ from schedule_parser import (
     slugify_group_name,
 )
 
-TELEGRAM_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
+TELEGRAM_TOKEN_ENV = "8304941548:AAHxseOjmhEv-U1Bfy7O1lWtLhlu2KlHYUE"
 DEFAULT_URL_ENV = "SCHEDULE_URL"
 DEFAULT_GROUP_ENV = "SCHEDULE_GROUP"
 BUTTON_TEXT_WEEKLY = "📅 Расписание недели"
