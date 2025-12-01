@@ -180,6 +180,13 @@ def parse_schedule(html: str, session: requests.Session) -> List[ScheduleEvent]:
     return events
 
 
+def fetch_events(url: str, group: str, session: requests.Session) -> List[ScheduleEvent]:
+    """Загружает и разбирает расписание в список событий."""
+
+    html = fetch_html(url, group, session)
+    return parse_schedule(html, session)
+
+
 def parse_date_from_header(text: str) -> Optional[dt.date]:
     """Извлекает дату формата dd.mm.yyyy из заголовка таблицы."""
 
@@ -458,6 +465,46 @@ def build_ics(events: List[ScheduleEvent], output_path: Path, target: str) -> No
 
     lines.append("END:VCALENDAR")
     output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def format_weekly_schedule(events: List[ScheduleEvent], reference_date: Optional[dt.date] = None) -> str:
+    """Возвращает текстовое расписание на неделю, начиная с понедельника."""
+
+    if not events:
+        return "Расписание не найдено."
+
+    ref_date = reference_date or dt.date.today()
+    start_of_week = ref_date - dt.timedelta(days=ref_date.weekday())
+    end_of_week = start_of_week + dt.timedelta(days=6)
+    weekly_events = [
+        event for event in events if start_of_week <= event.date <= end_of_week
+    ]
+    if not weekly_events:
+        return "На эту неделю занятий нет."
+
+    lines: List[str] = []
+    for date, day_events in _group_events_by_date(weekly_events):
+        lines.append(date.strftime("%A, %d.%m.%Y"))
+        for event in sorted(day_events, key=lambda e: e.start_time):
+            lesson_type = f" ({event.lesson_type})" if event.lesson_type else ""
+            teacher = f" — {event.teacher}" if event.teacher else ""
+            location = f" [{event.location}]" if event.location else ""
+            lines.append(
+                f"  {event.start_time.strftime('%H:%M')}–{event.end_time.strftime('%H:%M')}"
+                f" {event.title}{lesson_type}{teacher}{location}"
+            )
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _group_events_by_date(events: List[ScheduleEvent]) -> Iterable[Tuple[dt.date, List[ScheduleEvent]]]:
+    """Группирует события по дате."""
+
+    events_by_date: dict[dt.date, List[ScheduleEvent]] = {}
+    for event in events:
+        events_by_date.setdefault(event.date, []).append(event)
+    for date in sorted(events_by_date.keys()):
+        yield date, events_by_date[date]
 
 
 def escape_ics(value: str) -> str:
