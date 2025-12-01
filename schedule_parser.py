@@ -240,13 +240,17 @@ def parse_timeslot(
     if not cell:
         return None, None, None
     parts = list(cell.stripped_strings)
-    pair_number = extract_pair_number(parts)
-    time_parts = [part for part in parts if not part.endswith("пара")]
-    if len(time_parts) < 2:
+    tokens: list[str] = []
+    for part in parts:
+        tokens.extend(part.replace("\xa0", " ").split())
+
+    pair_number = extract_pair_number(parts + tokens)
+    time_tokens = [token for token in tokens if re.fullmatch(r"\d{2}:\d{2}", token)]
+    if len(time_tokens) < 2:
         return None, None, pair_number
     try:
-        start_time = dt.datetime.strptime(time_parts[0], "%H:%M").time()
-        end_time = dt.datetime.strptime(time_parts[1], "%H:%M").time()
+        start_time = dt.datetime.strptime(time_tokens[0], "%H:%M").time()
+        end_time = dt.datetime.strptime(time_tokens[1], "%H:%M").time()
     except ValueError:
         return None, None, pair_number
     return start_time, end_time, pair_number
@@ -255,8 +259,9 @@ def parse_timeslot(
 def extract_pair_number(parts: List[str]) -> Optional[int]:
     """Извлекает порядковый номер пары из сырой ячейки времени."""
 
-    for part in parts:
-        match = re.search(r"(\d+)\s*пара", part)
+    candidates = parts + [" ".join(parts)]
+    for part in candidates:
+        match = re.search(r"(\d+)\s*пара", part.lower())
         if match:
             try:
                 return int(match.group(1))
@@ -523,9 +528,16 @@ def slugify_group_name(group: str) -> str:
 
     normalized = unicodedata.normalize("NFKD", group.lower())
     transliterated = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-    transliterated = transliterated.replace("/", "_").replace(" ", "_")
-    transliterated = transliterated.replace("д", "d").replace("г", "g").replace("м", "m")
-    transliterated = re.sub(r"[^a-z0-9_.-]", "", transliterated)
+    transliterated = (
+        transliterated.replace("/", "_")
+        .replace(" ", "_")
+        .replace("-", "_")
+        .replace("д", "d")
+        .replace("г", "g")
+        .replace("м", "m")
+    )
+    transliterated = re.sub(r"[^a-z0-9_.]", "_", transliterated)
+    transliterated = re.sub(r"_+", "_", transliterated).strip("._")
     return transliterated or "schedule"
 
 
@@ -581,15 +593,15 @@ def main() -> None:
     mobile_output = args.output or Path.cwd() / f"schedule_{group_slug}.ics"
     google_output = args.google_output or Path.cwd() / f"schedule_{group_slug}_google.ics"
 
-    session = requests.Session()
-    html = fetch_html(args.url, args.group, session)
-    events = parse_schedule(html, session)
-    if not events:
-        logging.error("Не найдено ни одного занятия для указанной группы")
-        sys.exit(1)
+    with requests.Session() as session:
+        html = fetch_html(args.url, args.group, session)
+        events = parse_schedule(html, session)
+        if not events:
+            logging.error("Не найдено ни одного занятия для указанной группы")
+            sys.exit(1)
 
-    build_ics(events, mobile_output, target="mobile")
-    build_ics(events, google_output, target="google")
+        build_ics(events, mobile_output, target="mobile")
+        build_ics(events, google_output, target="google")
     logging.info("Сохранено занятий: %s", len(events))
     logging.info("Файлы: мобильный=%s, google=%s", mobile_output, google_output)
 
