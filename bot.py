@@ -341,7 +341,7 @@ def build_application(token: str) -> Application:
     return application
 
 
-async def main() -> None:
+def main() -> None:
     """Точка входа для запуска бота."""
 
     load_env_file()
@@ -355,8 +355,8 @@ async def main() -> None:
         raise SystemExit(msg)
 
     application = build_application(token)
-    await application.run_polling(drop_pending_updates=True)
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
