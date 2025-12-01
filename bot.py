@@ -446,9 +446,13 @@ async def main() -> None:
     application: Application | None = None
     try:
         application = build_application(token)
-        await asyncio.to_thread(
-            application.run_polling, drop_pending_updates=True
-        )
+        await application.initialize()
+        await application.start()
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        await application.updater.start_polling()
+        await application.updater.wait_for_stop()
+        await application.stop()
+        await application.shutdown()
     except KeyboardInterrupt:
         logging.info("Бот остановлен пользователем")
     except Exception as exc:
