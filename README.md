@@ -8,10 +8,11 @@
 python schedule_parser.py \
   --url "https://rasp.rea.ru/?q=15.14%D0%B4-%D0%B3%D0%B301%2F24%D0%BC" \
   --group "15.14д-гг01/24м" \
-  --output "schedule_15_14.ics"
+  --output "schedule_15_14.ics" \
+  --google-output "schedule_15_14_google.ics"
 ```
 
-Флаги `--url`, `--group` и `--output` имеют значения по умолчанию и могут не указываться.
+Флаги `--url`, `--group`, `--output` и `--google-output` имеют значения по умолчанию и могут не указываться.
 
 ## Зависимости
 

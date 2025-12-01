@@ -381,8 +381,13 @@ def build_event_alarms(pair_number: Optional[int]) -> List[str]:
     return alarms
 
 
-def build_ics(events: List[ScheduleEvent], output_path: Path) -> None:
-    """Создает .ics файл со списком занятий."""
+def build_ics(events: List[ScheduleEvent], output_path: Path, target: str) -> None:
+    """Создает .ics файл со списком занятий.
+
+    "target" определяет особенности формата:
+    - "mobile": локальная временная зона, цвета событий, напоминания.
+    - "google": время в UTC, без нестандартных полей.
+    """
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -391,22 +396,30 @@ def build_ics(events: List[ScheduleEvent], output_path: Path) -> None:
         "PRODID:-//REA Schedule Parser//EN",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        "X-WR-TIMEZONE:Europe/Moscow",
-        "BEGIN:VTIMEZONE",
-        "TZID:Europe/Moscow",
-        "BEGIN:STANDARD",
-        "DTSTART:19300101T000000",
-        "TZOFFSETFROM:+0300",
-        "TZOFFSETTO:+0300",
-        "TZNAME:MSK",
-        "END:STANDARD",
-        "END:VTIMEZONE",
     ]
+    if target == "mobile":
+        lines.extend(
+            [
+                "X-WR-TIMEZONE:Europe/Moscow",
+                "BEGIN:VTIMEZONE",
+                "TZID:Europe/Moscow",
+                "BEGIN:STANDARD",
+                "DTSTART:19300101T000000",
+                "TZOFFSETFROM:+0300",
+                "TZOFFSETTO:+0300",
+                "TZNAME:MSK",
+                "END:STANDARD",
+                "END:VTIMEZONE",
+            ]
+        )
+    else:
+        lines.append("X-WR-TIMEZONE:UTC")
 
     lesson_counters: dict[str, int] = {}
+    dtstamp = dt.datetime.now(tz=dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     for event in sorted(events, key=lambda e: (e.date, e.start_time)):
-        dt_start = dt.datetime.combine(event.date, event.start_time, tzinfo=MOSCOW_TZ)
-        dt_end = dt.datetime.combine(event.date, event.end_time, tzinfo=MOSCOW_TZ)
+        start_dt = dt.datetime.combine(event.date, event.start_time, tzinfo=MOSCOW_TZ)
+        end_dt = dt.datetime.combine(event.date, event.end_time, tzinfo=MOSCOW_TZ)
         summary, color = build_event_summary(event, lesson_counters)
         description_parts = []
         if event.teacher:
@@ -416,18 +429,28 @@ def build_ics(events: List[ScheduleEvent], output_path: Path) -> None:
         if event.extra_info:
             description_parts.append(event.extra_info)
         description = "\n".join(description_parts)
-        alarms = build_event_alarms(event.pair_number)
+        alarms = build_event_alarms(event.pair_number) if target == "mobile" else []
+
+        if target == "google":
+            dt_start_str = start_dt.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            dt_end_str = end_dt.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            dtstart_line = f"DTSTART:{dt_start_str}"
+            dtend_line = f"DTEND:{dt_end_str}"
+        else:
+            dtstart_line = f"DTSTART;TZID=Europe/Moscow:{start_dt.strftime('%Y%m%dT%H%M%S')}"
+            dtend_line = f"DTEND;TZID=Europe/Moscow:{end_dt.strftime('%Y%m%dT%H%M%S')}"
 
         event_block = [
             "BEGIN:VEVENT",
-            f"UID:{event.element_id or hash(summary + str(dt_start))}@rasp.rea.ru",
+            f"UID:{event.element_id or hash(summary + str(start_dt))}@rasp.rea.ru",
+            f"DTSTAMP:{dtstamp}",
             f"SUMMARY:{escape_ics(summary)}",
-            f"DTSTART;TZID=Europe/Moscow:{dt_start.strftime('%Y%m%dT%H%M%S')}",
-            f"DTEND;TZID=Europe/Moscow:{dt_end.strftime('%Y%m%dT%H%M%S')}",
+            dtstart_line,
+            dtend_line,
             f"DESCRIPTION:{escape_ics(description)}",
             f"LOCATION:{escape_ics(event.location or '')}",
         ]
-        if color:
+        if target == "mobile" and color:
             event_block.append(f"COLOR:{color}")
         event_block.extend(alarms)
         event_block.append("END:VEVENT")
@@ -481,7 +504,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "-o",
         "--output",
         type=Path,
-        help="Путь к итоговому .ics файлу",
+        help="Путь к .ics для стандартного мобильного календаря",
+    )
+    parser.add_argument(
+        "--google-output",
+        type=Path,
+        help="Путь к .ics файлу совместимому с Google Calendar",
     )
     parser.add_argument(
         "-v",
@@ -502,10 +530,9 @@ def main() -> None:
         format="%(levelname)s: %(message)s",
     )
 
-    output_path = args.output
-    if not output_path:
-        group_slug = slugify_group_name(args.group)
-        output_path = Path.cwd() / f"schedule_{group_slug}.ics"
+    group_slug = slugify_group_name(args.group)
+    mobile_output = args.output or Path.cwd() / f"schedule_{group_slug}.ics"
+    google_output = args.google_output or Path.cwd() / f"schedule_{group_slug}_google.ics"
 
     session = requests.Session()
     html = fetch_html(args.url, args.group, session)
@@ -514,9 +541,10 @@ def main() -> None:
         logging.error("Не найдено ни одного занятия для указанной группы")
         sys.exit(1)
 
-    build_ics(events, output_path)
+    build_ics(events, mobile_output, target="mobile")
+    build_ics(events, google_output, target="google")
     logging.info("Сохранено занятий: %s", len(events))
-    logging.info("Файл: %s", output_path)
+    logging.info("Файлы: мобильный=%s, google=%s", mobile_output, google_output)
 
 
 if __name__ == "__main__":
