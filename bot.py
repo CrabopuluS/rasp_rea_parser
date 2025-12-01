@@ -443,6 +443,7 @@ async def main() -> None:
         raise SystemExit(msg)
 
     logging.info("Запуск Telegram-бота...")
+    application: Application | None = None
     try:
         application = build_application(token)
         await application.initialize()
