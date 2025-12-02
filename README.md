@@ -7,8 +7,8 @@
    ```bash
    pip install -r requirements.txt
    ```
-2. Создайте файл `.env` (можно взять за основу `.env.example`) и задайте как минимум `TELEGRAM_BOT_TOKEN`.
-3. Запустите бота:
+2. Создайте файл `.env` (можно взять за основу `.env.example`) в формате `KEY="value"` и задайте как минимум `TELEGRAM_BOT_TOKEN`. Дополнительные символы вне схемы `KEY=VALUE` вызывают ошибки парсинга `python-dotenv`.
+3. Запустите бота. При старте явно создаётся event loop, чтобы избежать ошибки "There is no current event loop in thread 'MainThread'" на Python 3.13+:
    ```bash
    python bot.py
    ```

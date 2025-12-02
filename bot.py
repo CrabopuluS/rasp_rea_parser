@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from io import BytesIO
@@ -311,6 +312,8 @@ def main() -> None:
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    # Explicitly create event loop to avoid "no current event loop" on Python 3.13+
+    asyncio.set_event_loop(asyncio.new_event_loop())
     application = (
         ApplicationBuilder()
         .token(settings.telegram_bot_token)
