@@ -92,6 +92,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logging.info("Пользователь запустил /start")
     except Exception as exc:
         logging.error("Ошибка при выполнении команды /start: %s", exc)
+        if update.message:
+            await update.message.reply_text(
+                "Не удалось отправить приветственное сообщение. Попробуйте позже."
+            )
 
 
 async def send_schedule_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -99,7 +103,14 @@ async def send_schedule_files(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not update.message:
         return
+    if context.args and len(context.args) > 2:
+        await update.message.reply_text(
+            "Слишком много аргументов. Формат: /ics [url] [group]",
+            reply_markup=REPLY_KEYBOARD,
+        )
+        return
     url, group = resolve_args(context)
+    logging.info("Команда /ics: url=%s, group=%s", url, group)
     try:
         events = await fetch_events_async(url, group)
     except Exception as exc:
@@ -122,14 +133,9 @@ async def send_schedule_files(update: Update, context: ContextTypes.DEFAULT_TYPE
             build_ics(events, mobile_path, target="mobile")
             build_ics(events, google_path, target="google")
 
-            # Читаем файлы в памяти перед удалением временной директории
-            with mobile_path.open("rb") as f:
-                mobile_data = f.read()
-            with google_path.open("rb") as f:
-                google_data = f.read()
+            mobile_data = mobile_path.read_bytes()
+            google_data = google_path.read_bytes()
 
-        # Отправляем после закрытия temp директории
-        from io import BytesIO
         await update.message.reply_document(
             document=BytesIO(mobile_data),
             filename=mobile_path.name,
@@ -151,8 +157,15 @@ async def send_weekly_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if not update.message:
         return
+    if context.args and len(context.args) > 2:
+        await update.message.reply_text(
+            "Слишком много аргументов. Формат: /week [url] [group]",
+            reply_markup=REPLY_KEYBOARD,
+        )
+        return
     try:
         url, group = resolve_args(context)
+        logging.info("Команда /week: url=%s, group=%s", url, group)
         events = await fetch_events_async(url, group)
         if not events:
             text = "На эту неделю занятий не найдено или расписание недоступно."
@@ -174,40 +187,49 @@ async def plan_scheduled_text(
 
     if not update.message:
         return
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text(
-            "Укажите дату и время: /schedule_plan YYYY-MM-DD HH:MM [url] [group]",
-            reply_markup=REPLY_KEYBOARD,
-        )
-        return
-
-    date_arg, time_arg, *rest = context.args
-    run_at = parse_schedule_datetime(date_arg, time_arg)
-    if not run_at:
-        await update.message.reply_text(
-            "Неверный формат. Дата YYYY-MM-DD, время HH:MM (24ч).",
-            reply_markup=REPLY_KEYBOARD,
-        )
-        return
-    now = dt.datetime.now(tz=MOSCOW_TZ)
-    if run_at <= now:
-        await update.message.reply_text(
-            "Время должно быть в будущем относительно московского времени.",
-            reply_markup=REPLY_KEYBOARD,
-        )
-        return
-
-    url, group = resolve_scheduled_args(rest)
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    
-    if not chat_id:
-        await update.message.reply_text(
-            "Не удалось определить chat_id.",
-            reply_markup=REPLY_KEYBOARD,
-        )
-        return
-    
     try:
+        if not context.args or len(context.args) < 2:
+            await update.message.reply_text(
+                "Укажите дату и время: /plan YYYY-MM-DD HH:MM [url] [group]",
+                reply_markup=REPLY_KEYBOARD,
+            )
+            return
+
+        if len(context.args) > 4:
+            await update.message.reply_text(
+                "Слишком много аргументов. Формат: /plan YYYY-MM-DD HH:MM [url] [group]",
+                reply_markup=REPLY_KEYBOARD,
+            )
+            return
+
+        date_arg, time_arg, *rest = context.args
+        run_at = parse_schedule_datetime(date_arg, time_arg)
+        if not run_at:
+            await update.message.reply_text(
+                "Неверный формат. Дата YYYY-MM-DD, время HH:MM (24ч).",
+                reply_markup=REPLY_KEYBOARD,
+            )
+            return
+
+        now = dt.datetime.now(tz=MOSCOW_TZ)
+        if run_at <= now:
+            await update.message.reply_text(
+                "Время должно быть в будущем относительно московского времени.",
+                reply_markup=REPLY_KEYBOARD,
+            )
+            return
+
+        url, group = resolve_scheduled_args(rest)
+        logging.info("Команда /plan: url=%s, group=%s, datetime=%s", url, group, run_at)
+        chat_id = update.effective_chat.id if update.effective_chat else None
+
+        if not chat_id:
+            await update.message.reply_text(
+                "Не удалось определить chat_id.",
+                reply_markup=REPLY_KEYBOARD,
+            )
+            return
+
         job = context.job_queue.run_once(
             send_scheduled_text,
             when=run_at,
@@ -233,9 +255,9 @@ async def plan_scheduled_text(
         )
         logging.info("Запланирована отправка для %s на %s", chat_id, run_at)
     except Exception as exc:
-        logging.error("Ошибка при планировании отправки: %s", exc)
+        logging.error("Ошибка при обработке команды /plan: %s", exc)
         await update.message.reply_text(
-            "Ошибка при планировании отправки. Попробуйте позже.",
+            "Ошибка при обработке команды. Проверьте ввод и попробуйте позже.",
             reply_markup=REPLY_KEYBOARD,
         )
 
@@ -247,12 +269,15 @@ async def send_scheduled_text(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not job or job.chat_id is None:
         logging.warning("send_scheduled_text: job или chat_id не определены")
         return
-    
+
     try:
         url = job.data.get("url") if job.data else DEFAULT_URL
         group = job.data.get("group") if job.data else DEFAULT_GROUP
         reference_date = job.data.get("reference_date") if job.data else None
-        
+        logging.info(
+            "Отложенная отправка: url=%s, group=%s, chat_id=%s", url, group, job.chat_id
+        )
+
         events = await fetch_events_async(url, group)
         text = format_weekly_schedule(events, reference_date=reference_date)
         await context.bot.send_message(chat_id=job.chat_id, text=text)
@@ -273,14 +298,23 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not update.message:
         return
-    if update.message.text == BUTTON_TEXT_WEEKLY:
-        await send_weekly_text(update, context)
-    elif update.message.text == BUTTON_TEXT_ICS:
-        await send_schedule_files(update, context)
-    elif update.message.text == BUTTON_TEXT_PLAN:
+    try:
+        if update.message.text == BUTTON_TEXT_WEEKLY:
+            await send_weekly_text(update, context)
+        elif update.message.text == BUTTON_TEXT_ICS:
+            await send_schedule_files(update, context)
+        elif update.message.text == BUTTON_TEXT_PLAN:
+            await update.message.reply_text(
+                "Используйте команду /plan <YYYY-MM-DD> <HH:MM> [url] [group]"
+                " для плановой отправки текстового расписания. Время — московское.",
+                reply_markup=REPLY_KEYBOARD,
+            )
+        else:
+            logging.info("Неизвестная кнопка: %s", update.message.text)
+    except Exception as exc:
+        logging.error("Ошибка при обработке кнопки меню: %s", exc)
         await update.message.reply_text(
-            "Используйте команду /schedule_plan <YYYY-MM-DD> <HH:MM> [url] [group]"
-            " для плановой отправки текстового расписания. Время — московское.",
+            "Не удалось обработать запрос. Попробуйте позже.",
             reply_markup=REPLY_KEYBOARD,
         )
 
@@ -313,11 +347,20 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not update.message:
         return
-    text = update.message.text.lower()
-    if "ics" in text or "файл" in text or ".ics" in text:
-        await send_schedule_files(update, context)
-    else:
-        await send_weekly_text(update, context)
+    try:
+        text = update.message.text.lower()
+        if "ics" in text or "файл" in text or ".ics" in text:
+            logging.info("Получено приватное сообщение: запрос файлов")
+            await send_schedule_files(update, context)
+        else:
+            logging.info("Получено приватное сообщение: запрос текста")
+            await send_weekly_text(update, context)
+    except Exception as exc:
+        logging.error("Ошибка при обработке приватного сообщения: %s", exc)
+        await update.message.reply_text(
+            "Не удалось обработать сообщение. Попробуйте позже.",
+            reply_markup=REPLY_KEYBOARD,
+        )
 
 
 async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -325,10 +368,14 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if not update.message or not update.message.text:
         return
-    text = update.message.text.lower()
-    bot_username = (context.bot.username or "").lower()
-    if is_schedule_request(text, bot_username):
-        await send_weekly_text(update, context)
+    try:
+        text = update.message.text.lower()
+        bot_username = (context.bot.username or "").lower()
+        if is_schedule_request(text, bot_username):
+            logging.info("Групповой запрос расписания от %s", update.effective_chat.id)
+            await send_weekly_text(update, context)
+    except Exception as exc:
+        logging.error("Ошибка при обработке группового сообщения: %s", exc)
 
 
 def resolve_args(context: ContextTypes.DEFAULT_TYPE) -> Tuple[str, str]:
@@ -428,7 +475,7 @@ def build_application(token: str) -> Application:
     return application
 
 
-async def main() -> None:
+def main() -> None:
     """Точка входа для запуска бота."""
 
     load_env_file()
@@ -443,25 +490,15 @@ async def main() -> None:
         raise SystemExit(msg)
 
     logging.info("Запуск Telegram-бота...")
-    application: Application | None = None
     try:
         application = build_application(token)
-        await application.initialize()
-        await application.start()
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        await application.updater.start_polling()
-        # Блокируемся, пока не придет сигнал завершения (Ctrl+C)
-        await asyncio.Event().wait()
+        application.run_polling(drop_pending_updates=True)
     except KeyboardInterrupt:
         logging.info("Бот остановлен пользователем")
     except Exception as exc:
         logging.error("Критическая ошибка: %s", exc)
         raise
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
