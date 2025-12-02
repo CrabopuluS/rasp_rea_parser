@@ -475,7 +475,7 @@ def build_application(token: str) -> Application:
     return application
 
 
-async def main() -> None:
+def main() -> None:
     """Точка входа для запуска бота."""
 
     load_env_file()
@@ -490,26 +490,15 @@ async def main() -> None:
         raise SystemExit(msg)
 
     logging.info("Запуск Telegram-бота...")
-    application: Application | None = None
     try:
         application = build_application(token)
-        await application.initialize()
-        await application.start()
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        await application.updater.start_polling()
-        # Блокируемся, пока не придет сигнал завершения (Ctrl+C)
-        await asyncio.Event().wait()
+        application.run_polling(drop_pending_updates=True)
     except KeyboardInterrupt:
         logging.info("Бот остановлен пользователем")
     except Exception as exc:
         logging.error("Критическая ошибка: %s", exc)
         raise
-    finally:
-        if application:
-            await application.updater.stop()
-            await application.stop()
-            await application.shutdown()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
